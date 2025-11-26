@@ -2,29 +2,35 @@
 
 #############################################
 # Nginx Guardian - Automated IP Blocker
-# Analyzes current nginx access log and bans suspicious IPs
+# Monitors nginx logs and bans suspicious IPs
 #############################################
 
-
+# Configuration
 NGINX_LOG="/var/log/nginx/access.log"
+HOURS_TO_CHECK=24
 MIN_404_REQUESTS=10
 MIN_TOTAL_REQUESTS=50
 NGINX_CONF="/etc/nginx/conf.d/blocked_ips.conf"
 REPORT_FILE="/var/log/nginx_guardian_report.txt"
+TEMP_DIR="/tmp/nginx_guardian"
 
+# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Check if script is run as root
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}Error: This script must be run as root${NC}" 
    exit 1
 fi
 
-while getopts "l:f:t:c:r:" opt; do
+# Parse command line arguments
+while getopts "l:h:f:t:c:r:" opt; do
   case $opt in
     l) NGINX_LOG="$OPTARG" ;;
+    h) HOURS_TO_CHECK="$OPTARG" ;;
     f) MIN_404_REQUESTS="$OPTARG" ;;
     t) MIN_TOTAL_REQUESTS="$OPTARG" ;;
     c) NGINX_CONF="$OPTARG" ;;
@@ -33,98 +39,140 @@ while getopts "l:f:t:c:r:" opt; do
   esac
 done
 
+# Create temp directory
+mkdir -p "$TEMP_DIR"
+
+# Display banner
 echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║       Nginx Guardian v1.0              ║${NC}"
 echo -e "${GREEN}║   Automated IP Blocking System         ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
 echo ""
 
+# Check if nginx log exists
 if [ ! -f "$NGINX_LOG" ]; then
     echo -e "${RED}Error: Nginx log file not found at $NGINX_LOG${NC}"
     exit 1
 fi
 
-echo -e "${YELLOW}Analyzing access log...${NC}"
+# Calculate time threshold
+TIME_THRESHOLD=$(date -d "$HOURS_TO_CHECK hours ago" +"%d/%b/%Y:%H:%M:%S")
+echo -e "${YELLOW}Analyzing logs from the last $HOURS_TO_CHECK hours...${NC}"
+echo "Time threshold: $TIME_THRESHOLD"
 echo ""
 
-awk -v min_404="$MIN_404_REQUESTS" -v min_total="$MIN_TOTAL_REQUESTS" '
-{
-    ip = $1
-    status = $9
-    
-    total[ip]++
-    
-    if (status == "404") {
-        errors_404[ip]++
-    }
-    
-    if (status == "403" || status == "401") {
-        errors_403[ip]++
-    }
-}
+# Extract and analyze logs
+echo "Processing access logs..."
 
-END {
-    # Print suspicious IPs
-    for (ip in total) {
-        e404 = errors_404[ip] + 0
-        e403 = errors_403[ip] + 0
+# Get logs from the specified time period and analyze
+awk -v threshold="$TIME_THRESHOLD" '
+BEGIN { 
+    split(threshold, t, "[/:]")
+}
+{
+    split($4, log_time, "[/:]")
+    gsub(/\[/, "", log_time[1])
+    
+    log_epoch = mktime(log_time[3] " " month_to_num(log_time[2]) " " log_time[1] " " log_time[4] " " log_time[5] " " log_time[6])
+    threshold_epoch = mktime(t[3] " " month_to_num(t[2]) " " t[1] " " t[4] " " t[5] " " t[6])
+    
+    if (log_epoch >= threshold_epoch) {
+        ip = $1
+        status = $9
+        url = $7
         
-        if (e404 >= min_404 || total[ip] >= min_total) {
-            print ip, total[ip], e404, e403
+        total_requests[ip]++
+        
+        if (status == "404") {
+            not_found[ip]++
+            not_found_urls[url]++
+        }
+        
+        if (status == "403" || status == "401") {
+            forbidden[ip]++
         }
     }
 }
-' "$NGINX_LOG" > /tmp/suspicious_ips.txt
 
-# Count suspicious IPs
-banned_count=$(wc -l < /tmp/suspicious_ips.txt)
+function month_to_num(month) {
+    months["Jan"]=1; months["Feb"]=2; months["Mar"]=3; months["Apr"]=4
+    months["May"]=5; months["Jun"]=6; months["Jul"]=7; months["Aug"]=8
+    months["Sep"]=9; months["Oct"]=10; months["Nov"]=11; months["Dec"]=12
+    return months[month]
+}
 
+END {
+    for (ip in total_requests) {
+        print ip, total_requests[ip], not_found[ip]+0, forbidden[ip]+0
+    }
+    print "---URL_SEPARATOR---"
+    for (url in not_found_urls) {
+        print url, not_found_urls[url]
+    }
+}
+' "$NGINX_LOG" > "$TEMP_DIR/analysis.txt"
 
+# Split the output into IP analysis and URL analysis
+csplit -s "$TEMP_DIR/analysis.txt" '/---URL_SEPARATOR---/' -f "$TEMP_DIR/split_"
+
+# Process suspicious IPs
+suspicious_ips=()
+while read -r ip total_req not_found_req forbidden_req; do
+    if [ -z "$ip" ] || [ "$ip" = "---URL_SEPARATOR---" ]; then
+        continue
+    fi
+    
+    # Check if IP meets suspicious criteria
+    if [ "$not_found_req" -ge "$MIN_404_REQUESTS" ] || [ "$total_req" -ge "$MIN_TOTAL_REQUESTS" ]; then
+        suspicious_ips+=("$ip|$total_req|$not_found_req|$forbidden_req")
+    fi
+done < "$TEMP_DIR/split_00"
+
+# Initialize report
 {
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║           NGINX GUARDIAN - SECURITY REPORT                     ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo ""
     echo "Report Generated: $(date)"
+    echo "Analysis Period: Last $HOURS_TO_CHECK hours"
     echo "Log File: $NGINX_LOG"
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
 } > "$REPORT_FILE"
 
-
-if [ "$banned_count" -gt 0 ]; then
-    echo -e "${RED}Found $banned_count suspicious IP addresses${NC}"
+# Ban suspicious IPs
+banned_count=0
+if [ ${#suspicious_ips[@]} -gt 0 ]; then
+    echo -e "${RED}Found ${#suspicious_ips[@]} suspicious IP addresses${NC}"
     echo ""
-
+    
+    # Backup existing config
     if [ -f "$NGINX_CONF" ]; then
         cp "$NGINX_CONF" "${NGINX_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
     fi
     
-
-    {
-        echo "# Auto-generated by Nginx Guardian on $(date)"
-        echo "# DO NOT EDIT MANUALLY"
-        echo ""
-    } > "$NGINX_CONF"
+    # Create new blocking config
+    echo "# Auto-generated by Nginx Guardian on $(date)" > "$NGINX_CONF"
+    echo "# DO NOT EDIT MANUALLY" >> "$NGINX_CONF"
+    echo "" >> "$NGINX_CONF"
     
-    # Add header to report
     {
         echo "BLOCKED IP ADDRESSES:"
         echo "═══════════════════════════════════════════════════════════════"
         printf "%-20s %-15s %-15s %-15s\n" "IP ADDRESS" "TOTAL REQ" "404 ERRORS" "403/401"
         echo "───────────────────────────────────────────────────────────────"
     } >> "$REPORT_FILE"
-
-    while read -r ip total e404 e403; do
-
+    
+    for entry in "${suspicious_ips[@]}"; do
+        IFS='|' read -r ip total_req not_found_req forbidden_req <<< "$entry"
+        
         echo "deny $ip;" >> "$NGINX_CONF"
+        echo -e "${YELLOW}Banned:${NC} $ip (Total: $total_req, 404s: $not_found_req, 403/401: $forbidden_req)"
         
-
-        echo -e "${YELLOW}Banned:${NC} $ip (Total: $total, 404s: $e404, 403/401: $e403)"
-        
-
-        printf "%-20s %-15s %-15s %-15s\n" "$ip" "$total" "$e404" "$e403" >> "$REPORT_FILE"
-    done < /tmp/suspicious_ips.txt
+        printf "%-20s %-15s %-15s %-15s\n" "$ip" "$total_req" "$not_found_req" "$forbidden_req" >> "$REPORT_FILE"
+        ((banned_count++))
+    done
     
     echo "" >> "$NGINX_CONF"
     echo "allow all;" >> "$NGINX_CONF"
@@ -134,7 +182,23 @@ else
     echo "No suspicious IPs detected during this analysis period." >> "$REPORT_FILE"
 fi
 
+# Analyze most spammed URLs
+{
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "MOST COMMONLY SPAMMED URL ENDPOINTS (404 Errors):"
+    echo "═══════════════════════════════════════════════════════════════"
+} >> "$REPORT_FILE"
 
+if [ -f "$TEMP_DIR/split_01" ]; then
+    sort -t' ' -k2 -nr "$TEMP_DIR/split_01" | head -20 | while read -r url count; do
+        printf "%-60s %s\n" "$url" "$count" >> "$REPORT_FILE"
+    done
+else
+    echo "No 404 errors recorded" >> "$REPORT_FILE"
+fi
+
+# Add summary
 {
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
@@ -146,7 +210,7 @@ fi
     echo ""
 } >> "$REPORT_FILE"
 
-
+# Display summary
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}SUMMARY${NC}"
@@ -156,14 +220,14 @@ echo "Report saved to: $REPORT_FILE"
 echo "Configuration saved to: $NGINX_CONF"
 echo ""
 
-if [ "$banned_count" -gt 0 ]; then
+if [ $banned_count -gt 0 ]; then
     echo -e "${YELLOW}To apply changes, reload nginx:${NC}"
     echo "  systemctl reload nginx"
     echo "  OR"
     echo "  nginx -s reload"
     echo ""
     
-
+    # Offer to reload nginx
     read -p "Would you like to reload nginx now? (y/n): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -176,14 +240,14 @@ if [ "$banned_count" -gt 0 ]; then
     fi
 fi
 
-
+# Display report
 echo ""
 echo -e "${YELLOW}Full Report:${NC}"
 echo "═══════════════════════════════════════════════════════════════"
 cat "$REPORT_FILE"
 
 # Cleanup
-rm -f /tmp/suspicious_ips.txt
+rm -rf "$TEMP_DIR"
 
 echo ""
 echo -e "${GREEN}Nginx Guardian completed successfully!${NC}"
